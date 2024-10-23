@@ -105,18 +105,31 @@ def main():
             target_le = LabelEncoder()
             y = target_le.fit_transform(y)
 
-            if mode == "学習モード":
-                # 学習モードの処理
-                learning_mode(df, y, n_value_mode, target_le)
-            elif mode == "予測モード":
-                # 予測モードの処理
-                prediction_mode(df, y, n_value_mode)
-            elif mode == "地層図作成モード":
-                # 地層図作成モードの処理
-                geological_map_mode(df)
-            elif mode == "境界線モード":
-                # 境界線モードの処理
-                boundary_line_mode()
+            # データフレームとその他のデータをセッション状態に保存
+            st.session_state['df'] = df
+            st.session_state['y'] = y
+            st.session_state['n_value_mode'] = n_value_mode
+            st.session_state['target_le'] = target_le
+
+    # データフレームがセッションに保存されているか確認
+    if 'df' in st.session_state:
+        df = st.session_state['df']
+        y = st.session_state['y']
+        n_value_mode = st.session_state['n_value_mode']
+        target_le = st.session_state['target_le']
+
+        if mode == "学習モード":
+            learning_mode(df, y, n_value_mode, target_le)
+        elif mode == "予測モード":
+            prediction_mode(df, y, n_value_mode)
+            # 予測結果をセッションに保存
+            st.session_state['df'] = df
+        elif mode == "地層図作成モード":
+            geological_map_mode(df)
+        elif mode == "境界線モード":
+            boundary_line_mode()
+    else:
+        st.warning("ファイルをアップロードし、実行ボタンを押してください。")
 
 def learning_mode(df, y, n_value_mode, target_le):
     # One-hot encoding of '土質区分大分類簡略'
@@ -129,10 +142,10 @@ def learning_mode(df, y, n_value_mode, target_le):
     else:
         X = one_hot_columns
 
-    # Save the feature columns
+    # 特徴量のカラム名を保存
     feature_columns = X.columns.tolist()
 
-    # 学習モード
+    # 学習データとテストデータの分割
     X_train, X_test, y_train, y_test = train_test_split(X.values, y, test_size=0.2, random_state=42)
     input_size = X_train.shape[1]
     hidden_size = 100
@@ -186,13 +199,13 @@ def prediction_mode(df, y_true, n_value_mode):
     else:
         X = one_hot_columns
 
-    # Ensure all expected columns are present
+    # 学習時の特徴量と同じカラムを揃える
     for col in feature_columns:
         if col not in X.columns:
             X[col] = 0
     X = X[feature_columns]
 
-    # 学習時と同じ順序でデータ型をfloatに変換
+    # データ型をfloatに変換
     X = X.astype(float)
 
     # 説明変数をTensorに変換して予測
@@ -213,7 +226,7 @@ def prediction_mode(df, y_true, n_value_mode):
     # クラスとカラーマップの設定
     classes = target_le.classes_
     n_classes = len(classes)
-    cmap = plt.cm.get_cmap('viridis', n_classes)
+    cmap = plt.get_cmap('viridis', n_classes)
     norm = plt.Normalize(vmin=0, vmax=n_classes - 1)
 
     scatter_pred = ax[0].scatter(df['距離'], df['標高'], c=predicted_classes, cmap=cmap, norm=norm)
@@ -248,23 +261,152 @@ def prediction_mode(df, y_true, n_value_mode):
 
 def geological_map_mode(df):
     # 地層図作成モードの処理
-    if '予測結果' in df.columns:
+    if df is not None and '予測結果' in df.columns:
         required_columns = ['土質区分小分類', '距離', '標高', '予測結果', 'N値']
         if all(col in df.columns for col in required_columns):
-            # 境界面の検出や分類結果の追加処理をここで行う
-            # ...
-
-            # 結果の表示
-            st.success("地層図を作成しました。")
-
-            # グラフの表示
+            # コンター図1（予測結果）
             fig, ax = plt.subplots(figsize=(12, 6))
-            # グラフの作成コードをここに追加
-            # ...
+
+            # ラベルエンコーダーとカラーマップの設定
+            label_encoder = LabelEncoder()
+            label_codes = label_encoder.fit_transform(df['予測結果'])
+            classes = label_encoder.classes_
+            n_classes = len(classes)
+            cmap = plt.get_cmap('viridis', n_classes)
+            norm = plt.Normalize(vmin=0, vmax=n_classes - 1)
+
+            scatter = ax.scatter(df['距離'], df['標高'], c=label_codes, cmap=cmap, norm=norm)
+            for i, row in df.iterrows():
+                ax.text(row['距離'], row['標高'], f"{row['予測結果']}", fontsize=9)
+
+            cbar = fig.colorbar(scatter, ax=ax, ticks=np.arange(n_classes))
+            cbar.ax.set_yticklabels(classes)
+            ax.set_xlabel('距離')
+            ax.set_ylabel('標高')
             st.pyplot(fig)
 
-            # ベクトルデータの保存
-            vector_data = df[['距離', '標高', '予測結果']]
+            # 境界面の検出
+            df['N値'] = df['N値'].clip(upper=50)
+            boundary_x = []
+            boundary_y = []
+            grouped = df.groupby('距離')
+            for name, group in grouped:
+                mask = group['標高'] <= -10
+                group = group[mask]
+                if len(group) > 1:
+                    n_diff = group['N値'].diff().fillna(0)
+                    boundary_mask = n_diff >= 15
+                    if boundary_mask.any():
+                        first_boundary_idx = boundary_mask.idxmax()
+                        boundary_x.append(group['距離'].loc[first_boundary_idx])
+                        boundary_y.append(group['標高'].loc[first_boundary_idx])
+
+            # 境界面を基にした層の分類
+            def add_layer_prefix(row, boundary_x, boundary_y):
+                if len(boundary_x) > 0:
+                    boundary_level = np.interp(row['距離'], boundary_x, boundary_y)
+                    if row['標高'] > boundary_level:
+                        if row['予測結果'][0] in ['D', 'B']:
+                            return 'A' + row['予測結果'][1:]
+                        else:
+                            return 'A' + row['予測結果']
+                    else:
+                        if row['予測結果'][0] in ['A', 'B']:
+                            return 'D' + row['予測結果'][1:]
+                        else:
+                            return 'D' + row['予測結果']
+                return row['予測結果']
+
+            df['分類結果'] = df.apply(add_layer_prefix, axis=1, boundary_x=boundary_x, boundary_y=boundary_y)
+
+            # コンター図2（分類結果）
+            fig, ax = plt.subplots(figsize=(12, 6))
+
+            # ラベルエンコーダーとカラーマップの設定
+            label_encoder = LabelEncoder()
+            label_codes = label_encoder.fit_transform(df['分類結果'])
+            classes = label_encoder.classes_
+            n_classes = len(classes)
+            cmap = plt.get_cmap('coolwarm', n_classes)
+            norm = plt.Normalize(vmin=0, vmax=n_classes - 1)
+
+            scatter = ax.scatter(df['距離'], df['標高'], c=label_codes, cmap=cmap, norm=norm)
+            for i, row in df.iterrows():
+                ax.text(row['距離'], row['標高'], f"{row['分類結果']}", fontsize=9)
+
+            cbar = fig.colorbar(scatter, ax=ax, ticks=np.arange(n_classes))
+            cbar.ax.set_yticklabels(classes)
+            ax.set_xlabel('距離')
+            ax.set_ylabel('標高')
+
+            if boundary_x and boundary_y:
+                ax.plot(boundary_x, boundary_y, color='black', linewidth=2, linestyle='--', zorder=3)
+            st.pyplot(fig)
+
+            # 盛土をBに変更
+            def replace_with_b(row):
+                if isinstance(row['土質区分小分類'], str) and row['土質区分小分類'].startswith('盛土'):
+                    return 'B' + row['分類結果'][1:]
+                return row['分類結果']
+
+            df['分類結果B'] = df.apply(replace_with_b, axis=1)
+
+            # コンター図3（分類結果B）
+            fig, ax = plt.subplots(figsize=(12, 6))
+
+            label_encoder = LabelEncoder()
+            label_codes = label_encoder.fit_transform(df['分類結果B'])
+            classes = label_encoder.classes_
+            n_classes = len(classes)
+            cmap = plt.get_cmap('coolwarm', n_classes)
+            norm = plt.Normalize(vmin=0, vmax=n_classes - 1)
+
+            scatter = ax.scatter(df['距離'], df['標高'], c=label_codes, cmap=cmap, norm=norm)
+            for i, row in df.iterrows():
+                ax.text(row['距離'], row['標高'], f"{row['分類結果B']}", fontsize=9)
+
+            cbar = fig.colorbar(scatter, ax=ax, ticks=np.arange(n_classes))
+            cbar.ax.set_yticklabels(classes)
+            ax.set_xlabel('距離')
+            ax.set_ylabel('標高')
+            st.pyplot(fig)
+
+            # 火山灰や岩の処理
+            def replace_with_v_or_alt(row):
+                if isinstance(row['土質区分小分類'], str):
+                    if row['土質区分小分類'].endswith('火山灰'):
+                        if len(row['分類結果B']) > 1:
+                            return row['分類結果B'][:-1] + 'v'
+                        else:
+                            return row['分類結果B']
+                    elif row['土質区分小分類'].endswith('岩'):
+                        return 'Alt'
+                return row['分類結果B']
+
+            df['分類結果vAlt'] = df.apply(replace_with_v_or_alt, axis=1)
+
+            # コンター図4（分類結果vAlt）
+            fig, ax = plt.subplots(figsize=(12, 6))
+
+            label_encoder = LabelEncoder()
+            label_codes = label_encoder.fit_transform(df['分類結果vAlt'])
+            classes = label_encoder.classes_
+            n_classes = len(classes)
+            cmap = plt.get_cmap('coolwarm', n_classes)
+            norm = plt.Normalize(vmin=0, vmax=n_classes - 1)
+
+            scatter = ax.scatter(df['距離'], df['標高'], c=label_codes, cmap=cmap, norm=norm)
+            for i, row in df.iterrows():
+                ax.text(row['距離'], row['標高'], f"{row['分類結果vAlt']}", fontsize=9)
+
+            cbar = fig.colorbar(scatter, ax=ax, ticks=np.arange(n_classes))
+            cbar.ax.set_yticklabels(classes)
+            ax.set_xlabel('距離')
+            ax.set_ylabel('標高')
+            st.pyplot(fig)
+
+            # 最終データをベクトルデータとして保存 (x, y, z形式)
+            vector_data = df[['距離', '標高', '分類結果vAlt']]
             vector_data.columns = ['x', 'y', 'z']  # Rename columns to x, y, z
             vector_data.to_csv('geological_vector_data.csv', index=False)
             st.success("ベクトルデータを保存しました: geological_vector_data.csv")
@@ -277,11 +419,11 @@ def geological_map_mode(df):
                 file_name='geological_vector_data.csv',
                 mime='text/csv',
             )
-
         else:
-            st.warning("指定されたカラムがデータに存在しません。'土質区分小分類', '距離', '標高', 'N値'が必要です。")
+            st.warning("指定されたカラムがデータに存在しません。'土質区分小分類', '距離', '標高', '予測結果', 'N値'が必要です。")
     else:
         st.warning("予測結果がありません。まず予測モードで予測を実行してください。")
+
 
 def boundary_line_mode():
     # 境界線モードの処理
@@ -301,7 +443,7 @@ def boundary_line_mode():
 
         # カラーマップを作成
         n_classes = len(unique_labels)
-        cmap = plt.cm.get_cmap('tab10', n_classes)
+        cmap = plt.get_cmap('tab10', n_classes)
         colors = cmap(range(n_classes))
         label_colors = dict(zip(unique_labels, colors))
 
